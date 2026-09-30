@@ -43,19 +43,18 @@ Docker Hub:
 services:
   seerr:
     image: ghcr.io/draand28/seerr-manage-own-requests:latest
-    ports: ["30357:5055"]
+    ports: ["30357:30357"]
     volumes: ["./config:/app/config"]
     restart: unless-stopped
 ```
 
+The image listens on **30357** (`PORT=30357` baked in). Override `PORT` (and
+map the same number on both sides) to change it, or use `network_mode: host`
+and skip `ports` entirely.
+
 Docker Hub publishing requires two repository secrets:
 `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with
 read/write). Without them the workflows publish to GHCR only.
-
-Change the left side of `ports` to whatever host port you use. The image
-listens on **5055** internally (upstream default); to make the app itself
-listen elsewhere, set `PORT` and map the same number on both sides (e.g.
-`PORT=30357` with `30357:30357`).
 
 Or build the image yourself:
 

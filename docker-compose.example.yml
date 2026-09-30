@@ -9,12 +9,13 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
-      # To make the app itself listen on a different internal port, set PORT
-      # and map the same number on both sides (e.g. PORT=30357 + 30357:30357).
+      # The image already sets PORT=30357. Override here only to change it.
       # - PORT=30357
     ports:
-      # host:container - change the left side to whatever host port you use.
-      - 30357:5055
+      # host:container; the image listens on 30357.
+      - 30357:30357
+    # Instead of `ports`, you can use host networking (no mapping needed):
+    # network_mode: host
     volumes:
       - ./config:/app/config
     restart: unless-stopped

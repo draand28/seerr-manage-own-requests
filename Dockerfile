@@ -37,6 +37,7 @@ FROM ${NODE_IMAGE}
 ARG COMMIT_TAG
 ENV NODE_ENV=production
 ENV COMMIT_TAG=${COMMIT_TAG:-local}
+ENV PORT=30357
 RUN apk add --no-cache tzdata
 USER node:node
 WORKDIR /app
@@ -45,5 +46,5 @@ COPY --chown=node:node --from=prod-deps /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/.next ./.next
 COPY --chown=node:node --from=build /app/dist ./dist
 RUN touch config/DOCKER && echo "{\"commitTag\": \"${COMMIT_TAG}\"}" > committag.json
-EXPOSE 5055
+EXPOSE 30357
 CMD [ "npm", "start" ]

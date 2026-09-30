@@ -1,5 +1,5 @@
 diff --git a/seerr-api.yml b/seerr-api.yml
-index ae1fdc2..753109b 100644
+index ae1fdc2..388ac60 100644
 --- a/seerr-api.yml
 +++ b/seerr-api.yml
 @@ -6734,7 +6734,7 @@ paths:
@@ -20,6 +20,46 @@ index ae1fdc2..753109b 100644
        tags:
          - media
        parameters:
+@@ -7361,6 +7361,39 @@ paths:
+       responses:
+         '204':
+           description: Successfully removed media item
++  /media/{mediaId}/size:
++    get:
++      summary: Get media file size
++      description: Returns the total file size (in bytes) of the media as reported by Radarr/Sonarr, or null when the media is not tracked by a configured server.
++      tags:
++        - media
++      parameters:
++        - in: path
++          name: mediaId
++          description: Media ID
++          required: true
++          example: '1'
++          schema:
++            type: string
++        - in: query
++          name: is4k
++          description: Whether to check the 4K service instance (true) or regular service instance (false)
++          required: false
++          example: false
++          schema:
++            type: boolean
++      responses:
++        '200':
++          description: Media file size returned in bytes
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  size:
++                    type: number
++                    nullable: true
++                    example: 123456789
+   /media/{mediaId}/{status}:
+     post:
+       summary: Update media status
 diff --git a/server/entity/Media.test.ts b/server/entity/Media.test.ts
 new file mode 100644
 index 0000000..d306d7a

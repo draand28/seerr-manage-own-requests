@@ -1,0 +1,150 @@
+name: Auto-track upstream Seerr
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: auto-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      tag: ${{ steps.check.outputs.tag }}
+      upstream: ${{ steps.check.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Compare latest release against the pinned ref
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          tag=$(gh api repos/seerr-team/seerr/releases/latest --jq '.tag_name')
+          echo "Latest Seerr release: ${tag}"
+
+          git clone --quiet --depth 1 --branch "${tag}" \
+            https://github.com/seerr-team/seerr.git /tmp/seerr
+          upstream=$(git -C /tmp/seerr rev-parse HEAD)
+          echo "Commit: ${upstream}"
+
+          current=$(grep -oE '[0-9a-f]{40}' install.sh | head -1)
+          if [ "${current}" = "${upstream}" ]; then
+            echo "Already tracking ${tag}."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            if ! git -C /tmp/seerr apply --check "$patch"; then
+              echo "broken=true" >> "$GITHUB_OUTPUT"
+              echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+              echo "upstream=${upstream}" >> "$GITHUB_OUTPUT"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "Patch does not apply to ${tag}; not bumping."
+              exit 0
+            fi
+          done
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "upstream=${upstream}" >> "$GITHUB_OUTPUT"
+
+      - name: Open an issue when the patch no longer applies
+        if: steps.check.outputs.broken == 'true'
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          UPSTREAM: ${{ steps.check.outputs.upstream }}
+        with:
+          script: |
+            const title = 'Upstream Seerr patch no longer applies';
+            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`;
+            const found = await github.rest.search.issuesAndPullRequests({ q });
+            if (found.data.total_count > 0) {
+              core.info('An issue is already open; skipping.');
+              return;
+            }
+            const body = [
+              `The nightly updater found that \`patches/0001-manage-own-requests.patch\` no longer applies to Seerr **${process.env.TAG}** (\`${process.env.UPSTREAM}\`).`,
+              '',
+              'The pin was **not** bumped and the published image is still the last working release.',
+              '',
+              'To fix: rebase the patch onto the new release, push, then re-run the "Auto-track upstream Seerr" workflow.',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+            });
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Bump the pinned ref
+        env:
+          UPSTREAM: ${{ needs.check.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s/[0-9a-f]{40}/${UPSTREAM}/g" Dockerfile install.sh install.ps1
+          git diff --stat
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+
+      - name: Build and push (validates the patched release)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Commit the bump only after a successful build
+        env:
+          UPSTREAM: ${{ needs.check.outputs.upstream }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile install.sh install.ps1
+          git commit -m "chore: track Seerr ${TAG} (${UPSTREAM})"
+          git push origin main

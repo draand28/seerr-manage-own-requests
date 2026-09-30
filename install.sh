@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SEERR_REPO="${SEERR_REPO:-https://github.com/seerr-team/seerr.git}"
-SEERR_REF="${SEERR_REF:-e9590629b8215676a352ec2413d7c8ee7e6974df}"
+SEERR_REF="${SEERR_REF:-e2f24cb46079746936516c723b09820360f95113}"
 SEERR_DIR="${1:-seerr}"
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)/patches"
 

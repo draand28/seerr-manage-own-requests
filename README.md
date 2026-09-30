@@ -25,9 +25,9 @@ Requests**, and the relevant buttons appear only on your own requests.
 
 ## Install
 
-The pinned Seerr commit is in `install.sh` / `install.ps1` / `Dockerfile` as
-`e959062`. If you run a different Seerr version, check the compatibility note
-under [Updating](#updating).
+The pinned Seerr release is in `install.sh` / `install.ps1` / `Dockerfile`
+(currently **v3.5.0**). If you run a different Seerr version, check the
+compatibility note under [Updating](#updating).
 
 ### Docker (recommended)
 
@@ -85,17 +85,29 @@ apply the patch (idempotently), install dependencies and build.
 
 ## Updating
 
-The patch is built against a specific upstream commit because Seerr has no
-plugin API. To move to a newer Seerr, rebase
-[`patches/0001-manage-own-requests.patch`](patches/0001-manage-own-requests.patch)
-onto the target commit and refresh the `SEERR_REF` value in
-`install.sh`/`install.ps1`/`Dockerfile`.
+The patch is built against a specific upstream release because Seerr has no
+plugin API.
 
-To update a source install after that:
+[`.github/workflows/auto-update.yml`](.github/workflows/auto-update.yml) runs
+nightly and keeps the pin current automatically:
+
+- It looks up the latest Seerr **release**.
+- If the patch still applies to it, it bumps `SEERR_REF` in
+  `install.sh`/`install.ps1`/`Dockerfile`, commits, and rebuilds `:latest`.
+- If the patch **no longer applies** (upstream changed the same lines), it
+  opens an issue instead of pushing a broken build. Someone then rebases
+  [`patches/0001-manage-own-requests.patch`](patches/0001-manage-own-requests.patch).
+
+To pull the update: `docker pull ghcr.io/draand28/seerr-manage-own-requests:latest`
+and recreate the container. For a source install, re-run the installer after
+setting the new ref:
 
 ```sh
 SEERR_REF=<new-commit> ./install.sh path-to-seerr
 ```
+
+To move manually, rebase the patch onto the target release and update the
+`SEERR_REF` value in `install.sh`/`install.ps1`/`Dockerfile`.
 
 ## Uninstall
 

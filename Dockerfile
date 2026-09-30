@@ -4,7 +4,8 @@
 ARG NODE_IMAGE=node:22.23.2-alpine3.23
 
 FROM ${NODE_IMAGE} AS base
-ARG SEERR_REF=e9590629b8215676a352ec2413d7c8ee7e6974df
+# Pin = Seerr release v3.5.0. Bumped automatically by .github/workflows/auto-update.yml.
+ARG SEERR_REF=e2f24cb46079746936516c723b09820360f95113
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable && apk add --no-cache git

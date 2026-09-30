@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $SeerrRepo = if ($env:SEERR_REPO) { $env:SEERR_REPO } else { "https://github.com/seerr-team/seerr.git" }
-$SeerrRef = if ($env:SEERR_REF) { $env:SEERR_REF } else { "e9590629b8215676a352ec2413d7c8ee7e6974df" }
+$SeerrRef = if ($env:SEERR_REF) { $env:SEERR_REF } else { "e2f24cb46079746936516c723b09820360f95113" }
 $PatchDir = Join-Path $PSScriptRoot "patches"
 
 if (-not (Test-Path (Join-Path $SeerrDir ".git"))) {

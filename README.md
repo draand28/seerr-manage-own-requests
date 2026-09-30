@@ -31,8 +31,12 @@ compatibility note under [Updating](#updating).
 
 ### Docker (recommended)
 
-A prebuilt image is published to GHCR by
-[`.github/workflows/docker.yml`](.github/workflows/docker.yml):
+A prebuilt image is published by
+[`.github/workflows/docker.yml`](.github/workflows/docker.yml) to both GHCR and
+Docker Hub:
+
+- `ghcr.io/draand28/seerr-manage-own-requests:latest`
+- `draand28/seerr-manage-own-requests:latest` (Docker Hub)
 
 ```yaml
 # docker-compose.yml
@@ -43,6 +47,10 @@ services:
     volumes: ["./config:/app/config"]
     restart: unless-stopped
 ```
+
+Docker Hub publishing requires two repository secrets:
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with
+read/write). Without them the workflows publish to GHCR only.
 
 Change the left side of `ports` to whatever host port you use. The image
 listens on **5055** internally (upstream default); to make the app itself

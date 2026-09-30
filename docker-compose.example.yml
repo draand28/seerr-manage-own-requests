@@ -9,8 +9,12 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
+      # To make the app itself listen on a different internal port, set PORT
+      # and map the same number on both sides (e.g. PORT=30357 + 30357:30357).
+      # - PORT=30357
     ports:
-      - 5055:5055
+      # host:container - change the left side to whatever host port you use.
+      - 30357:5055
     volumes:
       - ./config:/app/config
     restart: unless-stopped

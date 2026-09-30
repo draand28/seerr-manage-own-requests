@@ -39,10 +39,15 @@ A prebuilt image is published to GHCR by
 services:
   seerr:
     image: ghcr.io/draand28/seerr-manage-own-requests:latest
-    ports: ["5055:5055"]
+    ports: ["30357:5055"]
     volumes: ["./config:/app/config"]
     restart: unless-stopped
 ```
+
+Change the left side of `ports` to whatever host port you use. The image
+listens on **5055** internally (upstream default); to make the app itself
+listen elsewhere, set `PORT` and map the same number on both sides (e.g.
+`PORT=30357` with `30357:30357`).
 
 Or build the image yourself:
 

@@ -1,0 +1,16 @@
+services:
+  seerr:
+    # Pull the prebuilt image (once the GHCR workflow has published it)...
+    image: ghcr.io/draand28/seerr-manage-own-requests:latest
+    # ...or build it locally instead:
+    # build: .
+    container_name: seerr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    ports:
+      - 5055:5055
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped

@@ -1,0 +1,620 @@
+diff --git a/seerr-api.yml b/seerr-api.yml
+index ae1fdc2..753109b 100644
+--- a/seerr-api.yml
++++ b/seerr-api.yml
+@@ -6734,7 +6734,7 @@ paths:
+           description: Only pending requests can be modified
+     delete:
+       summary: Delete request
+-      description: Removes a request. If the user has the `MANAGE_REQUESTS` permission, any request can be removed. Otherwise, only pending requests can be removed.
++      description: Removes a request. If the user has the `MANAGE_REQUESTS` permission, any request can be removed. If the user has the `MANAGE_OWN_REQUESTS` permission, their own requests can be removed. Otherwise, only pending requests can be removed.
+       tags:
+         - request
+       parameters:
+@@ -7340,7 +7340,7 @@ paths:
+   /media/{mediaId}/file:
+     delete:
+       summary: Delete media file
+-      description: Removes a media file from radarr/sonarr. The `ADMIN` permission is required to perform this action.
++      description: Removes a media file from radarr/sonarr. The `MANAGE_REQUESTS` permission is required, or `MANAGE_OWN_REQUESTS` when the user is the only requester of the media.
+       tags:
+         - media
+       parameters:
+diff --git a/server/entity/Media.test.ts b/server/entity/Media.test.ts
+new file mode 100644
+index 0000000..d306d7a
+--- /dev/null
++++ b/server/entity/Media.test.ts
+@@ -0,0 +1,59 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++
++import { MediaRequestStatus } from '@server/constants/media';
++import Media from '@server/entity/Media';
++import { MediaRequest } from '@server/entity/MediaRequest';
++import { User } from '@server/entity/User';
++
++const request = (
++  userId: number,
++  is4k: boolean,
++  status = MediaRequestStatus.APPROVED
++) =>
++  new MediaRequest({
++    is4k,
++    status,
++    requestedBy: new User({ id: userId }),
++  });
++
++describe('Media.isOwnedBy', () => {
++  it('is true when the user is the only non-declined requester', () => {
++    const media = new Media({ requests: [request(1, false)] });
++
++    assert.strictEqual(media.isOwnedBy(1, false), true);
++    assert.strictEqual(media.isOwnedBy(2, false), false);
++  });
++
++  it('ignores requests for the other resolution', () => {
++    const media = new Media({ requests: [request(1, true)] });
++
++    assert.strictEqual(media.isOwnedBy(1, false), false);
++    assert.strictEqual(media.isOwnedBy(1, true), true);
++  });
++
++  it('is false when another user still has an active request', () => {
++    const media = new Media({
++      requests: [request(1, false), request(2, false)],
++    });
++
++    assert.strictEqual(media.isOwnedBy(1, false), false);
++  });
++
++  it('ignores declined requests from other users', () => {
++    const media = new Media({
++      requests: [
++        request(1, false),
++        request(2, false, MediaRequestStatus.DECLINED),
++      ],
++    });
++
++    assert.strictEqual(media.isOwnedBy(1, false), true);
++  });
++
++  it('is false when there are no requests', () => {
++    const media = new Media({ requests: [] });
++
++    assert.strictEqual(media.isOwnedBy(1, false), false);
++  });
++});
+diff --git a/server/entity/Media.ts b/server/entity/Media.ts
+index 3709e36..8c75fe5 100644
+--- a/server/entity/Media.ts
++++ b/server/entity/Media.ts
+@@ -254,6 +254,23 @@ class Media {
+     }
+   }
+ 
++  /**
++   * Returns true when the user is the only requester whose access depends on
++   * the files for this media in the given resolution. Declined requests are
++   * ignored, and at least one non-declined request must belong to the user.
++   */
++  public isOwnedBy(userId: number, is4k: boolean): boolean {
++    const requests = (this.requests ?? []).filter(
++      (request) =>
++        request.is4k === is4k && request.status !== MediaRequestStatus.DECLINED
++    );
++
++    return (
++      requests.length > 0 &&
++      requests.every((request) => request.requestedBy?.id === userId)
++    );
++  }
++
+   @AfterLoad()
+   public setPlexUrls(): void {
+     const { machineId, webAppUrl } = getSettings().plex;
+diff --git a/server/lib/permissions.ts b/server/lib/permissions.ts
+index edc9f7e..45e752f 100644
+--- a/server/lib/permissions.ts
++++ b/server/lib/permissions.ts
+@@ -28,6 +28,7 @@ export enum Permission {
+   RECENT_VIEW = 67108864,
+   WATCHLIST_VIEW = 134217728,
+   MANAGE_BLOCKLIST = 268435456,
++  MANAGE_OWN_REQUESTS = 536870912,
+   VIEW_BLOCKLIST = 1073741824,
+ }
+ 
+diff --git a/server/routes/media.test.ts b/server/routes/media.test.ts
+new file mode 100644
+index 0000000..d0e7988
+--- /dev/null
++++ b/server/routes/media.test.ts
+@@ -0,0 +1,227 @@
++import assert from 'node:assert/strict';
++import { before, beforeEach, describe, it, mock } from 'node:test';
++
++import RadarrAPI from '@server/api/servarr/radarr';
++import TheMovieDb from '@server/api/themoviedb';
++import type {
++  TmdbMovieDetails,
++  TmdbTvDetails,
++} from '@server/api/themoviedb/interfaces';
++import {
++  MediaRequestStatus,
++  MediaStatus,
++  MediaType,
++} from '@server/constants/media';
++import { getRepository } from '@server/datasource';
++import Media from '@server/entity/Media';
++import { MediaRequest } from '@server/entity/MediaRequest';
++import { User } from '@server/entity/User';
++import { Permission } from '@server/lib/permissions';
++import type { RadarrSettings } from '@server/lib/settings';
++import { getSettings } from '@server/lib/settings';
++import { checkUser } from '@server/middleware/auth';
++import { setupTestDb } from '@server/test/db';
++import type { Express } from 'express';
++import express from 'express';
++import session from 'express-session';
++import request from 'supertest';
++import authRoutes from './auth';
++import mediaRoutes from './media';
++
++// removeMovie is an instance arrow property, so it cannot be mocked directly.
++// Stubbing the lookup it calls lets removeMovie run and lets us count invocations
++// without touching the network (an id of 0 short-circuits before the HTTP call).
++const getMovieByTmdbIdMock = mock.method(
++  RadarrAPI.prototype,
++  'getMovieByTmdbId',
++  async () => ({ id: 0, title: '' })
++).mock;
++
++// Saving a request triggers the subscribers, which look up TMDB metadata.
++Object.defineProperty(TheMovieDb.prototype, 'getMovie', {
++  get() {
++    return async ({ movieId }: { movieId: number }) =>
++      ({ id: movieId, external_ids: {} }) as unknown as TmdbMovieDetails;
++  },
++  set() {},
++  configurable: true,
++});
++
++Object.defineProperty(TheMovieDb.prototype, 'getTvShow', {
++  get() {
++    return async ({ tvId }: { tvId: number }) =>
++      ({ id: tvId, external_ids: {} }) as unknown as TmdbTvDetails;
++  },
++  set() {},
++  configurable: true,
++});
++
++mock.method(MediaRequest, 'sendNotification', async () => undefined);
++
++function configureRadarr(): void {
++  const settings = getSettings();
++  settings.radarr = [
++    {
++      id: 0,
++      name: 'Radarr',
++      hostname: 'localhost',
++      port: 7878,
++      apiKey: 'test-key',
++      baseUrl: '',
++      useSsl: false,
++      activeProfileId: 1,
++      activeDirectory: '/movies',
++      is4k: false,
++      minimumAvailability: 'released',
++      tags: [],
++      isDefault: true,
++      syncEnabled: true,
++      preventSearch: false,
++      externalUrl: '',
++    },
++  ] as unknown as RadarrSettings[];
++}
++
++let app: Express;
++
++function createApp() {
++  const app = express();
++  app.use(express.json());
++  app.use(
++    session({
++      secret: 'test-secret',
++      resave: false,
++      saveUninitialized: false,
++    })
++  );
++  app.use(checkUser);
++  app.use('/auth', authRoutes);
++  app.use('/media', mediaRoutes);
++  app.use(
++    (
++      err: { status?: number; message?: string },
++      _req: express.Request,
++      res: express.Response,
++      // eslint-disable-next-line @typescript-eslint/no-unused-vars
++      _next: express.NextFunction
++    ) => {
++      res
++        .status(err.status ?? 500)
++        .json({ status: err.status ?? 500, message: err.message });
++    }
++  );
++  return app;
++}
++
++before(() => {
++  app = createApp();
++});
++
++beforeEach(() => {
++  getMovieByTmdbIdMock.resetCalls();
++});
++
++setupTestDb();
++
++async function loginAs(email: string, password: string) {
++  const settings = getSettings();
++  const priorLocalLogin = settings.main.localLogin;
++  settings.main.localLogin = true;
++
++  try {
++    const agent = request.agent(app);
++    const res = await agent.post('/auth/local').send({ email, password });
++    assert.strictEqual(res.status, 200);
++    return agent;
++  } finally {
++    settings.main.localLogin = priorLocalLogin;
++  }
++}
++
++async function setPermissions(email: string, permissions: number) {
++  const userRepo = getRepository(User);
++  const user = await userRepo.findOneOrFail({ where: { email } });
++  user.permissions = permissions;
++  await userRepo.save(user);
++}
++
++async function seedMediaRequest(ownerEmail: string, media?: Media) {
++  const userRepo = getRepository(User);
++  const mediaRepo = getRepository(Media);
++  const requestRepo = getRepository(MediaRequest);
++
++  const owner = await userRepo.findOneOrFail({ where: { email: ownerEmail } });
++
++  const targetMedia =
++    media ??
++    (await mediaRepo.save(
++      new Media({
++        mediaType: MediaType.MOVIE,
++        tmdbId: 12345,
++        status: MediaStatus.AVAILABLE,
++        status4k: MediaStatus.UNKNOWN,
++      })
++    ));
++
++  const mediaRequest = await requestRepo.save(
++    new MediaRequest({
++      type: MediaType.MOVIE,
++      status: MediaRequestStatus.APPROVED,
++      media: targetMedia,
++      requestedBy: owner,
++      is4k: false,
++    })
++  );
++
++  return { media: targetMedia, mediaRequest };
++}
++
++describe('DELETE /media/:id/file', () => {
++  it('allows the sole requester with MANAGE_OWN_REQUESTS to delete the file', async () => {
++    configureRadarr();
++    await setPermissions('demo@seerr.dev', Permission.MANAGE_OWN_REQUESTS);
++    const { media } = await seedMediaRequest('demo@seerr.dev');
++
++    const agent = await loginAs('demo@seerr.dev', 'test1234');
++    const res = await agent.delete(`/media/${media.id}/file?is4k=false`);
++
++    assert.strictEqual(res.status, 204);
++    assert.strictEqual(getMovieByTmdbIdMock.callCount(), 1);
++  });
++
++  it('forbids deleting the file when another user has an active request', async () => {
++    configureRadarr();
++    await setPermissions('demo@seerr.dev', Permission.MANAGE_OWN_REQUESTS);
++    const { media } = await seedMediaRequest('demo@seerr.dev');
++    await seedMediaRequest('admin@seerr.dev', media);
++
++    const agent = await loginAs('demo@seerr.dev', 'test1234');
++    const res = await agent.delete(`/media/${media.id}/file?is4k=false`);
++
++    assert.strictEqual(res.status, 403);
++    assert.strictEqual(getMovieByTmdbIdMock.callCount(), 0);
++  });
++
++  it('forbids a MANAGE_OWN_REQUESTS user from deleting another user media', async () => {
++    configureRadarr();
++    await setPermissions('demo@seerr.dev', Permission.MANAGE_OWN_REQUESTS);
++    const { media } = await seedMediaRequest('admin@seerr.dev');
++
++    const agent = await loginAs('demo@seerr.dev', 'test1234');
++    const res = await agent.delete(`/media/${media.id}/file?is4k=false`);
++
++    assert.strictEqual(res.status, 403);
++    assert.strictEqual(getMovieByTmdbIdMock.callCount(), 0);
++  });
++
++  it('allows an admin to delete any file', async () => {
++    configureRadarr();
++    const { media } = await seedMediaRequest('demo@seerr.dev');
++
++    const agent = await loginAs('admin@seerr.dev', 'test1234');
++    const res = await agent.delete(`/media/${media.id}/file?is4k=false`);
++
++    assert.strictEqual(res.status, 204);
++    assert.strictEqual(getMovieByTmdbIdMock.callCount(), 1);
++  });
++});
+diff --git a/server/routes/media.ts b/server/routes/media.ts
+index 2295f00..8d8e0bf 100644
+--- a/server/routes/media.ts
++++ b/server/routes/media.ts
+@@ -202,18 +202,37 @@ mediaRoutes.delete(
+ 
+ mediaRoutes.delete(
+   '/:id/file',
+-  isAuthenticated(Permission.MANAGE_REQUESTS),
++  isAuthenticated(
++    [Permission.MANAGE_REQUESTS, Permission.MANAGE_OWN_REQUESTS],
++    {
++      type: 'or',
++    }
++  ),
+   async (req, res, next) => {
+     try {
+       const settings = getSettings();
+       const mediaRepository = getRepository(Media);
+       const media = await mediaRepository.findOneOrFail({
+         where: { id: Number(req.params.id) },
++        relations: { requests: { requestedBy: true } },
+       });
+ 
+       const is4k = String(req.query.is4k) === 'true';
+       const isMovie = media.mediaType === MediaType.MOVIE;
+ 
++      if (
++        !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
++        !(
++          req.user?.hasPermission(Permission.MANAGE_OWN_REQUESTS) &&
++          media.isOwnedBy(req.user.id, is4k)
++        )
++      ) {
++        return next({
++          status: 403,
++          message: 'You do not have permission to delete this media.',
++        });
++      }
++
+       let serviceSettings;
+       if (isMovie) {
+         serviceSettings = settings.radarr.find(
+diff --git a/server/routes/request.test.ts b/server/routes/request.test.ts
+index 6e0f27d..8ffa7b0 100644
+--- a/server/routes/request.test.ts
++++ b/server/routes/request.test.ts
+@@ -291,6 +291,62 @@ describe('DELETE /request/:requestId', () => {
+     assert.strictEqual(res.status, 401);
+   });
+ 
++  it('allows a user with MANAGE_OWN_REQUESTS to delete their own approved request', async () => {
++    const userRepo = getRepository(User);
++    const owner = await userRepo.findOneOrFail({
++      where: { email: 'demo@seerr.dev' },
++    });
++    owner.permissions = Permission.MANAGE_OWN_REQUESTS;
++    await userRepo.save(owner);
++
++    const mediaRequest = await seedRequest(MediaRequestStatus.APPROVED);
++
++    const agent = await loginAs('demo@seerr.dev', 'test1234');
++    const res = await agent.delete(`/request/${mediaRequest.id}`);
++
++    assert.strictEqual(res.status, 204);
++  });
++
++  it('prevents a user with MANAGE_OWN_REQUESTS from deleting an approved request they do not own', async () => {
++    const userRepo = getRepository(User);
++    const mediaRepo = getRepository(Media);
++    const requestRepo = getRepository(MediaRequest);
++
++    const requestingUser = await userRepo.findOneOrFail({
++      where: { email: 'demo@seerr.dev' },
++    });
++    requestingUser.permissions = Permission.MANAGE_OWN_REQUESTS;
++    await userRepo.save(requestingUser);
++
++    const owner = await userRepo.findOneOrFail({
++      where: { email: 'admin@seerr.dev' },
++    });
++
++    const media = await mediaRepo.save(
++      new Media({
++        mediaType: MediaType.MOVIE,
++        tmdbId: 98765,
++        status: MediaStatus.UNKNOWN,
++        status4k: MediaStatus.UNKNOWN,
++      })
++    );
++
++    const mediaRequest = await requestRepo.save(
++      new MediaRequest({
++        type: MediaType.MOVIE,
++        status: MediaRequestStatus.APPROVED,
++        media,
++        requestedBy: owner,
++        is4k: false,
++      })
++    );
++
++    const agent = await loginAs('demo@seerr.dev', 'test1234');
++    const res = await agent.delete(`/request/${mediaRequest.id}`);
++
++    assert.strictEqual(res.status, 401);
++  });
++
+   it('returns 404 for a non-existent request', async () => {
+     const agent = await loginAs('admin@seerr.dev', 'test1234');
+     const res = await agent.delete('/request/99999999');
+diff --git a/server/routes/request.ts b/server/routes/request.ts
+index acdb90c..a66c36f 100644
+--- a/server/routes/request.ts
++++ b/server/routes/request.ts
+@@ -243,9 +243,18 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
+         }
+       });
+ 
+-      // add canRemove prop if user has permission
+-      if (req.user?.hasPermission(Permission.MANAGE_REQUESTS)) {
++      const canManageRequests =
++        req.user?.hasPermission(Permission.MANAGE_REQUESTS) ?? false;
++      const canManageOwnRequests =
++        req.user?.hasPermission(Permission.MANAGE_OWN_REQUESTS) ?? false;
++
++      // add canRemove prop if user has permission to manage the request
++      if (canManageRequests || canManageOwnRequests) {
+         mappedRequests = mappedRequests.map((r) => {
++          if (!canManageRequests && r.requestedBy?.id !== req.user?.id) {
++            return r;
++          }
++
+           switch (r.type) {
+             case MediaType.MOVIE: {
+               return {
+@@ -714,10 +723,18 @@ requestRoutes.delete('/:requestId', async (req, res, next) => {
+         relations: { requestedBy: true, modifiedBy: true },
+       });
+ 
++      const isOwner = request.requestedBy.id === req.user?.id;
++      const canManageRequests = req.user?.hasPermission(
++        Permission.MANAGE_REQUESTS
++      );
++      const canManageOwnRequests = req.user?.hasPermission(
++        Permission.MANAGE_OWN_REQUESTS
++      );
++
+       if (
+-        !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
+-        (request.requestedBy.id !== req.user?.id ||
+-          request.status !== MediaRequestStatus.PENDING)
++        !canManageRequests &&
++        !(canManageOwnRequests && isOwner) &&
++        !(isOwner && request.status === MediaRequestStatus.PENDING)
+       ) {
+         return next({
+           status: 401,
+diff --git a/src/components/PermissionEdit/index.tsx b/src/components/PermissionEdit/index.tsx
+index cbba176..4648656 100644
+--- a/src/components/PermissionEdit/index.tsx
++++ b/src/components/PermissionEdit/index.tsx
+@@ -17,6 +17,9 @@ export const messages = defineMessages('components.PermissionEdit', {
+   managerequests: 'Manage Requests',
+   managerequestsDescription:
+     'Grant permission to manage media requests. All requests made by a user with this permission will be automatically approved.',
++  manageownrequests: 'Manage Own Requests',
++  manageownrequestsDescription:
++    'Grant permission to delete your own requests and remove their media from Sonarr and Radarr.',
+   request: 'Request',
+   requestDescription: 'Grant permission to submit requests for non-4K media.',
+   requestMovies: 'Request Movies',
+@@ -122,6 +125,14 @@ export const PermissionEdit = ({
+       description: intl.formatMessage(messages.managerequestsDescription),
+       permission: Permission.MANAGE_REQUESTS,
+       children: [
++        {
++          id: 'manageownrequests',
++          name: intl.formatMessage(messages.manageownrequests),
++          description: intl.formatMessage(
++            messages.manageownrequestsDescription
++          ),
++          permission: Permission.MANAGE_OWN_REQUESTS,
++        },
+         {
+           id: 'advancedrequest',
+           name: intl.formatMessage(messages.advancedrequest),
+diff --git a/src/components/RequestCard/index.tsx b/src/components/RequestCard/index.tsx
+index 0f2341f..536cf0b 100644
+--- a/src/components/RequestCard/index.tsx
++++ b/src/components/RequestCard/index.tsx
+@@ -614,6 +614,31 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
+                   </Tooltip>
+                 </div>
+               )}
++            {requestData.status !== MediaRequestStatus.PENDING &&
++              hasPermission(Permission.MANAGE_OWN_REQUESTS) &&
++              requestData.requestedBy.id === user?.id && (
++                <div>
++                  <Button
++                    buttonType="danger"
++                    buttonSize="sm"
++                    className="hidden sm:block"
++                    onClick={() => deleteRequest()}
++                  >
++                    <TrashIcon />
++                    <span>{intl.formatMessage(globalMessages.delete)}</span>
++                  </Button>
++                  <Tooltip content={intl.formatMessage(messages.deleterequest)}>
++                    <Button
++                      buttonType="danger"
++                      buttonSize="sm"
++                      className="sm:hidden"
++                      onClick={() => deleteRequest()}
++                    >
++                      <TrashIcon />
++                    </Button>
++                  </Tooltip>
++                </div>
++              )}
+           </div>
+         </div>
+         <Link
+diff --git a/src/components/RequestList/RequestItem/index.tsx b/src/components/RequestList/RequestItem/index.tsx
+index 29a11ac..23d7e5c 100644
+--- a/src/components/RequestList/RequestItem/index.tsx
++++ b/src/components/RequestList/RequestItem/index.tsx
+@@ -421,6 +421,11 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
+       : []
+   );
+ 
++  const canManageRequests = hasPermission(Permission.MANAGE_REQUESTS);
++  const canManageOwnRequests =
++    hasPermission(Permission.MANAGE_OWN_REQUESTS) &&
++    requestData.requestedBy.id === user?.id;
++
+   return (
+     <>
+       <RequestModal
+@@ -701,7 +706,7 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
+               </Button>
+             )}
+           {requestData.status !== MediaRequestStatus.PENDING &&
+-            hasPermission(Permission.MANAGE_REQUESTS) && (
++            (canManageRequests || canManageOwnRequests) && (
+               <>
+                 <ConfirmButton
+                   onClick={() => deleteRequest()}
+diff --git a/src/i18n/locale/en.json b/src/i18n/locale/en.json
+index 4238256..fc8aba9 100644
+--- a/src/i18n/locale/en.json
++++ b/src/i18n/locale/en.json
+@@ -444,6 +444,8 @@
+   "components.PermissionEdit.manageblocklistDescription": "Grant permission to manage blocklisted media.",
+   "components.PermissionEdit.manageissues": "Manage Issues",
+   "components.PermissionEdit.manageissuesDescription": "Grant permission to manage media issues.",
++  "components.PermissionEdit.manageownrequests": "Manage Own Requests",
++  "components.PermissionEdit.manageownrequestsDescription": "Grant permission to delete your own requests and remove their media from Sonarr and Radarr.",
+   "components.PermissionEdit.managerequests": "Manage Requests",
+   "components.PermissionEdit.managerequestsDescription": "Grant permission to manage media requests. All requests made by a user with this permission will be automatically approved.",
+   "components.PermissionEdit.request": "Request",

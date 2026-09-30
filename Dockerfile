@@ -21,6 +21,10 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store CI=true pnpm install --prod --
 
 FROM base AS build
 ARG TARGETPLATFORM
+# Must match the final stage so the client-baked commitTag equals the server's,
+# otherwise StatusChecker shows a permanent "app updated, reload" modal.
+ARG COMMIT_TAG
+ENV COMMIT_TAG=${COMMIT_TAG:-local}
 RUN case "${TARGETPLATFORM}" in \
   'linux/arm64' | 'linux/arm/v7') \
   apk add --no-cache python3 make g++ gcc libc6-compat bash && \
@@ -32,7 +36,7 @@ RUN pnpm build && rm -rf .next/cache
 FROM ${NODE_IMAGE}
 ARG COMMIT_TAG
 ENV NODE_ENV=production
-ENV COMMIT_TAG=${COMMIT_TAG}
+ENV COMMIT_TAG=${COMMIT_TAG:-local}
 RUN apk add --no-cache tzdata
 USER node:node
 WORKDIR /app

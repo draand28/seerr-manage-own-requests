@@ -127,10 +127,10 @@ index edc9f7e..45e752f 100644
  
 diff --git a/server/routes/media.test.ts b/server/routes/media.test.ts
 new file mode 100644
-index 0000000..d0e7988
+index 0000000..bb1ad92
 --- /dev/null
 +++ b/server/routes/media.test.ts
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,240 @@
 +import assert from 'node:assert/strict';
 +import { before, beforeEach, describe, it, mock } from 'node:test';
 +
@@ -358,10 +358,32 @@ index 0000000..d0e7988
 +    assert.strictEqual(getMovieByTmdbIdMock.callCount(), 1);
 +  });
 +});
++
++describe('GET /media/:id/size', () => {
++  it('returns a null size when no Radarr server is configured', async () => {
++    getSettings().radarr = [];
++    const { media } = await seedMediaRequest('demo@seerr.dev');
++
++    const agent = await loginAs('demo@seerr.dev', 'test1234');
++    const res = await agent.get(`/media/${media.id}/size?is4k=false`);
++
++    assert.strictEqual(res.status, 200);
++    assert.strictEqual(res.body.size, null);
++  });
++});
 diff --git a/server/routes/media.ts b/server/routes/media.ts
-index 2295f00..8d8e0bf 100644
+index 2295f00..84467d8 100644
 --- a/server/routes/media.ts
 +++ b/server/routes/media.ts
+@@ -12,7 +12,7 @@ import type {
+   MediaWatchDataResponse,
+ } from '@server/interfaces/api/mediaInterfaces';
+ import { Permission } from '@server/lib/permissions';
+-import { getSettings } from '@server/lib/settings';
++import { getSettings, type DVRSettings } from '@server/lib/settings';
+ import logger from '@server/logger';
+ import { isAuthenticated } from '@server/middleware/auth';
+ import { Router } from 'express';
 @@ -202,18 +202,37 @@ mediaRoutes.delete(
  
  mediaRoutes.delete(
@@ -401,6 +423,99 @@ index 2295f00..8d8e0bf 100644
        let serviceSettings;
        if (isMovie) {
          serviceSettings = settings.radarr.find(
+@@ -305,6 +324,92 @@ mediaRoutes.delete(
+   }
+ );
+ 
++const sizeCache = new Map<string, { expires: number; size: number | null }>();
++const SIZE_CACHE_TTL = 5 * 60 * 1000;
++// Disabled under the test runner, where media IDs repeat between tests.
++const sizeCacheEnabled = process.env.NODE_ENV !== 'test';
++
++mediaRoutes.get('/:id/size', isAuthenticated(), async (req, res, next) => {
++  try {
++    const is4k = String(req.query.is4k) === 'true';
++    const cacheKey = `${req.params.id}:${is4k}`;
++    const cached = sizeCacheEnabled ? sizeCache.get(cacheKey) : undefined;
++    if (cached && cached.expires > Date.now()) {
++      return res.status(200).json({ size: cached.size });
++    }
++
++    const settings = getSettings();
++    const mediaRepository = getRepository(Media);
++    const media = await mediaRepository.findOneOrFail({
++      where: { id: Number(req.params.id) },
++    });
++
++    const isMovie = media.mediaType === MediaType.MOVIE;
++    let serviceSettings: DVRSettings | undefined;
++    if (isMovie) {
++      serviceSettings = settings.radarr.find(
++        (radarr) => radarr.isDefault && radarr.is4k === is4k
++      );
++    } else {
++      serviceSettings = settings.sonarr.find(
++        (sonarr) => sonarr.isDefault && sonarr.is4k === is4k
++      );
++    }
++
++    const specificServiceId = is4k ? media.serviceId4k : media.serviceId;
++    if (
++      specificServiceId != null &&
++      specificServiceId >= 0 &&
++      serviceSettings?.id !== specificServiceId
++    ) {
++      serviceSettings = isMovie
++        ? settings.radarr.find((radarr) => radarr.id === specificServiceId)
++        : settings.sonarr.find((sonarr) => sonarr.id === specificServiceId);
++    }
++
++    let size: number | null = null;
++    if (serviceSettings) {
++      if (isMovie) {
++        const radarr = new RadarrAPI({
++          apiKey: serviceSettings.apiKey,
++          url: RadarrAPI.buildUrl(serviceSettings, '/api/v3'),
++        });
++        const movies = await radarr.getLibraryMoviesByTmdbId(media.tmdbId);
++        size = movies[0]?.movieFile?.size ?? null;
++      } else if (media.tvdbId) {
++        const sonarr = new SonarrAPI({
++          apiKey: serviceSettings.apiKey,
++          url: SonarrAPI.buildUrl(serviceSettings, '/api/v3'),
++        });
++        const series = await sonarr.getLibrarySeriesByTvdbId(media.tvdbId);
++        size = series[0]?.statistics?.sizeOnDisk ?? null;
++      }
++    }
++
++    if (sizeCacheEnabled) {
++      sizeCache.set(cacheKey, {
++        expires: Date.now() + SIZE_CACHE_TTL,
++        size,
++      });
++    }
++
++    return res.status(200).json({ size });
++  } catch (e) {
++    if (e instanceof EntityNotFoundError) {
++      return next({ status: 404, message: 'Media not found.' });
++    }
++    logger.error('Something went wrong retrieving media file size', {
++      label: 'Media',
++      mediaId: req.params.id,
++      message: e.message,
++    });
++    return next({
++      status: 500,
++      message: 'Unable to retrieve media file size.',
++    });
++  }
++});
++
+ mediaRoutes.get<{ id: string }, MediaWatchDataResponse>(
+   '/:id/watch_data',
+   isAuthenticated(Permission.ADMIN),
 diff --git a/server/routes/request.test.ts b/server/routes/request.test.ts
 index 6e0f27d..8ffa7b0 100644
 --- a/server/routes/request.test.ts
@@ -560,6 +675,98 @@ index 4234da6..6c51c85 100644
          className={`relative overflow-hidden ${className}`}
          onClick={(e) => {
            e.preventDefault();
+diff --git a/src/components/MediaSize/index.tsx b/src/components/MediaSize/index.tsx
+new file mode 100644
+index 0000000..d5540a6
+--- /dev/null
++++ b/src/components/MediaSize/index.tsx
+@@ -0,0 +1,42 @@
++import { formatBytes } from '@app/utils/numberHelpers';
++import type { ReactNode } from 'react';
++import useSWR from 'swr';
++
++interface MediaSizeProps {
++  mediaId?: number;
++  is4k?: boolean;
++  label?: ReactNode;
++  className?: string;
++  containerClassName?: string;
++  labelClassName?: string;
++}
++
++const MediaSize = ({
++  mediaId,
++  is4k = false,
++  label,
++  className,
++  containerClassName,
++  labelClassName,
++}: MediaSizeProps) => {
++  const { data } = useSWR<{ size: number | null }>(
++    mediaId ? `/api/v1/media/${mediaId}/size?is4k=${is4k}` : null
++  );
++
++  if (!data?.size) {
++    return null;
++  }
++
++  if (label) {
++    return (
++      <div className={containerClassName}>
++        <span className={labelClassName}>{label}</span>
++        <span className={className}>{formatBytes(data.size)}</span>
++      </div>
++    );
++  }
++
++  return <span className={className}>{formatBytes(data.size)}</span>;
++};
++
++export default MediaSize;
+diff --git a/src/components/MovieDetails/index.tsx b/src/components/MovieDetails/index.tsx
+index 80aded5..6216498 100644
+--- a/src/components/MovieDetails/index.tsx
++++ b/src/components/MovieDetails/index.tsx
+@@ -17,6 +17,7 @@ import Tooltip from '@app/components/Common/Tooltip';
+ import ExternalLinkBlock from '@app/components/ExternalLinkBlock';
+ import IssueModal from '@app/components/IssueModal';
+ import ManageSlideOver from '@app/components/ManageSlideOver';
++import MediaSize from '@app/components/MediaSize';
+ import MediaSlider from '@app/components/MediaSlider';
+ import PersonCard from '@app/components/PersonCard';
+ import RequestButton from '@app/components/RequestButton';
+@@ -73,6 +74,8 @@ const messages = defineMessages('components.MovieDetails', {
+   originallanguage: 'Original Language',
+   overview: 'Overview',
+   runtime: '{minutes} minutes',
++  filesize: 'File Size',
++  filesize4k: '4K File Size',
+   cast: 'Cast',
+   recommendations: 'Recommendations',
+   similar: 'Similar Titles',
+@@ -867,6 +870,22 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
+               <span>{intl.formatMessage(globalMessages.status)}</span>
+               <span className="media-fact-value">{data.status}</span>
+             </div>
++            <MediaSize
++              mediaId={data.mediaInfo?.id}
++              label={intl.formatMessage(messages.filesize)}
++              containerClassName="media-fact"
++              className="media-fact-value"
++            />
++            {settings.currentSettings.movie4kEnabled &&
++              data.mediaInfo?.id && (
++                <MediaSize
++                  mediaId={data.mediaInfo?.id}
++                  is4k
++                  label={intl.formatMessage(messages.filesize4k)}
++                  containerClassName="media-fact"
++                  className="media-fact-value"
++                />
++              )}
+             {filteredReleases && filteredReleases.length > 0 ? (
+               <div className="media-fact">
+                 <span>
 diff --git a/src/components/PermissionEdit/index.tsx b/src/components/PermissionEdit/index.tsx
 index cbba176..4648656 100644
 --- a/src/components/PermissionEdit/index.tsx
@@ -590,27 +797,30 @@ index cbba176..4648656 100644
            id: 'advancedrequest',
            name: intl.formatMessage(messages.advancedrequest),
 diff --git a/src/components/RequestCard/index.tsx b/src/components/RequestCard/index.tsx
-index 0f2341f..e6e9802 100644
+index 0f2341f..0fa1ec6 100644
 --- a/src/components/RequestCard/index.tsx
 +++ b/src/components/RequestCard/index.tsx
-@@ -2,6 +2,7 @@ import Spinner from '@app/assets/spinner.svg';
+@@ -2,7 +2,9 @@ import Spinner from '@app/assets/spinner.svg';
  import Badge from '@app/components/Common/Badge';
  import Button from '@app/components/Common/Button';
  import CachedImage from '@app/components/Common/CachedImage';
 +import ConfirmButton from '@app/components/Common/ConfirmButton';
  import Tooltip from '@app/components/Common/Tooltip';
++import MediaSize from '@app/components/MediaSize';
  import RequestModal from '@app/components/RequestModal';
  import StatusBadge from '@app/components/StatusBadge';
-@@ -46,6 +47,8 @@ const messages = defineMessages('components.RequestCard', {
+ import useDeepLinks from '@app/hooks/useDeepLinks';
+@@ -46,6 +48,9 @@ const messages = defineMessages('components.RequestCard', {
    editrequest: 'Edit Request',
    cancelrequest: 'Cancel Request',
    deleterequest: 'Delete Request',
 +  deleterequestandfiles: 'Delete Request & Files',
 +  failedremovemedia: 'Something went wrong while removing the media.',
++  filesize: 'File Size',
    unknowntitle: 'Unknown Title',
  });
  
-@@ -241,7 +244,7 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
+@@ -241,7 +246,7 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
      data: requestData,
      error: requestError,
      mutate: revalidate,
@@ -619,7 +829,7 @@ index 0f2341f..e6e9802 100644
      `/api/v1/request/${request.id}`,
      {
        fallbackData: request,
-@@ -284,6 +287,36 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
+@@ -284,6 +289,36 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
      mutate('/api/v1/request/count');
    };
  
@@ -656,7 +866,22 @@ index 0f2341f..e6e9802 100644
    const retryRequest = async () => {
      setRetrying(true);
  
-@@ -614,6 +647,48 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
+@@ -413,6 +448,14 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
+               </Link>
+             </div>
+           )}
++          <MediaSize
++            mediaId={requestData.media.id}
++            is4k={requestData.is4k}
++            label={intl.formatMessage(messages.filesize)}
++            containerClassName="card-field"
++            labelClassName="card-field-name"
++            className="flex truncate text-sm text-gray-300"
++          />
+           {!isMovie(title) && request.seasons.length > 0 && (
+             <div className="my-0.5 hidden items-center text-sm sm:my-1 sm:flex">
+               <span className="mr-2 font-bold">
+@@ -614,6 +657,48 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                    </Tooltip>
                  </div>
                )}
@@ -706,10 +931,26 @@ index 0f2341f..e6e9802 100644
          </div>
          <Link
 diff --git a/src/components/RequestList/RequestItem/index.tsx b/src/components/RequestList/RequestItem/index.tsx
-index 29a11ac..23d7e5c 100644
+index 29a11ac..d9aaabd 100644
 --- a/src/components/RequestList/RequestItem/index.tsx
 +++ b/src/components/RequestList/RequestItem/index.tsx
-@@ -421,6 +421,11 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
+@@ -3,6 +3,7 @@ import Badge from '@app/components/Common/Badge';
+ import Button from '@app/components/Common/Button';
+ import CachedImage from '@app/components/Common/CachedImage';
+ import ConfirmButton from '@app/components/Common/ConfirmButton';
++import MediaSize from '@app/components/MediaSize';
+ import RequestModal from '@app/components/RequestModal';
+ import StatusBadge from '@app/components/StatusBadge';
+ import useDeepLinks from '@app/hooks/useDeepLinks';
+@@ -45,6 +46,7 @@ const messages = defineMessages('components.RequestList.RequestItem', {
+   mediaerror: '{mediaType} Not Found',
+   editrequest: 'Edit Request',
+   deleterequest: 'Delete Request',
++  filesize: 'File Size',
+   cancelRequest: 'Cancel Request',
+   tmdbid: 'TMDB ID',
+   tvdbid: 'TheTVDB ID',
+@@ -421,6 +423,11 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
        : []
    );
  
@@ -721,7 +962,22 @@ index 29a11ac..23d7e5c 100644
    return (
      <>
        <RequestModal
-@@ -701,7 +706,7 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
+@@ -562,6 +569,14 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
+                 />
+               )}
+             </div>
++            <MediaSize
++              mediaId={requestData.media.id}
++              is4k={requestData.is4k}
++              label={intl.formatMessage(messages.filesize)}
++              containerClassName="card-field"
++              labelClassName="card-field-name"
++              className="flex truncate text-sm text-gray-300"
++            />
+             <div className="card-field">
+               {hasPermission(
+                 [Permission.MANAGE_REQUESTS, Permission.REQUEST_VIEW],
+@@ -701,7 +716,7 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                </Button>
              )}
            {requestData.status !== MediaRequestStatus.PENDING &&
@@ -730,11 +986,64 @@ index 29a11ac..23d7e5c 100644
                <>
                  <ConfirmButton
                    onClick={() => deleteRequest()}
+diff --git a/src/components/TvDetails/index.tsx b/src/components/TvDetails/index.tsx
+index a265627..0b9e2cd 100644
+--- a/src/components/TvDetails/index.tsx
++++ b/src/components/TvDetails/index.tsx
+@@ -18,6 +18,7 @@ import Tooltip from '@app/components/Common/Tooltip';
+ import ExternalLinkBlock from '@app/components/ExternalLinkBlock';
+ import IssueModal from '@app/components/IssueModal';
+ import ManageSlideOver from '@app/components/ManageSlideOver';
++import MediaSize from '@app/components/MediaSize';
+ import MediaSlider from '@app/components/MediaSlider';
+ import PersonCard from '@app/components/PersonCard';
+ import RequestButton from '@app/components/RequestButton';
+@@ -74,6 +75,8 @@ import useSWR from 'swr';
+ 
+ const messages = defineMessages('components.TvDetails', {
+   firstAirDate: 'First Air Date',
++  filesize: 'File Size',
++  filesize4k: '4K File Size',
+   nextAirDate: 'Next Air Date',
+   originallanguage: 'Original Language',
+   overview: 'Overview',
+@@ -1187,6 +1190,22 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
+               <span>{intl.formatMessage(globalMessages.status)}</span>
+               <span className="media-fact-value">{data.status}</span>
+             </div>
++            <MediaSize
++              mediaId={data.mediaInfo?.id}
++              label={intl.formatMessage(messages.filesize)}
++              containerClassName="media-fact"
++              className="media-fact-value"
++            />
++            {settings.currentSettings.series4kEnabled &&
++              data.mediaInfo?.id && (
++                <MediaSize
++                  mediaId={data.mediaInfo?.id}
++                  is4k
++                  label={intl.formatMessage(messages.filesize4k)}
++                  containerClassName="media-fact"
++                  className="media-fact-value"
++                />
++              )}
+             {data.firstAirDate && (
+               <div className="media-fact">
+                 <span>{intl.formatMessage(messages.firstAirDate)}</span>
 diff --git a/src/i18n/locale/en.json b/src/i18n/locale/en.json
-index 4238256..a957337 100644
+index 4238256..66e6607 100644
 --- a/src/i18n/locale/en.json
 +++ b/src/i18n/locale/en.json
-@@ -444,6 +444,8 @@
+@@ -344,6 +344,8 @@
+   "components.MovieDetails.cast": "Cast",
+   "components.MovieDetails.digitalrelease": "Digital Release",
+   "components.MovieDetails.downloadstatus": "Download Status",
++  "components.MovieDetails.filesize": "File Size",
++  "components.MovieDetails.filesize4k": "4K File Size",
+   "components.MovieDetails.imdbuserscore": "IMDB User Score – votes: {formattedCount}",
+   "components.MovieDetails.managemovie": "Manage Movie",
+   "components.MovieDetails.mark4kavailable": "Mark as Available in 4K",
+@@ -444,6 +446,8 @@
    "components.PermissionEdit.manageblocklistDescription": "Grant permission to manage blocklisted media.",
    "components.PermissionEdit.manageissues": "Manage Issues",
    "components.PermissionEdit.manageissuesDescription": "Grant permission to manage media issues.",
@@ -743,7 +1052,7 @@ index 4238256..a957337 100644
    "components.PermissionEdit.managerequests": "Manage Requests",
    "components.PermissionEdit.managerequestsDescription": "Grant permission to manage media requests. All requests made by a user with this permission will be automatically approved.",
    "components.PermissionEdit.request": "Request",
-@@ -513,8 +515,10 @@
+@@ -513,9 +517,12 @@
    "components.RequestCard.cancelrequest": "Cancel Request",
    "components.RequestCard.declinerequest": "Decline Request",
    "components.RequestCard.deleterequest": "Delete Request",
@@ -752,5 +1061,24 @@ index 4238256..a957337 100644
    "components.RequestCard.failedmodify": "Something went wrong while modifying the request.",
 +  "components.RequestCard.failedremovemedia": "Something went wrong while removing the media.",
    "components.RequestCard.failedretry": "Something went wrong while retrying the request.",
++  "components.RequestCard.filesize": "File Size",
    "components.RequestCard.mediaerror": "{mediaType} Not Found",
    "components.RequestCard.seasons": "{seasonCount, plural, one {Season} other {Seasons}}",
+   "components.RequestCard.tmdbid": "TMDB ID",
+@@ -525,6 +532,7 @@
+   "components.RequestList.RequestItem.deleterequest": "Delete Request",
+   "components.RequestList.RequestItem.editrequest": "Edit Request",
+   "components.RequestList.RequestItem.failedmodify": "Something went wrong while modifying the request.",
++  "components.RequestList.RequestItem.filesize": "File Size",
+   "components.RequestList.RequestItem.failedretry": "Something went wrong while retrying the request.",
+   "components.RequestList.RequestItem.mediaerror": "{mediaType} Not Found",
+   "components.RequestList.RequestItem.modified": "Modified",
+@@ -1376,6 +1384,8 @@
+   "components.TvDetails.episodeCount": "{episodeCount, plural, one {# Episode} other {# Episodes}}",
+   "components.TvDetails.episodeRuntime": "Episode Runtime",
+   "components.TvDetails.episodeRuntimeMinutes": "{runtime} minutes",
++  "components.TvDetails.filesize": "File Size",
++  "components.TvDetails.filesize4k": "4K File Size",
+   "components.TvDetails.firstAirDate": "First Air Date",
+   "components.TvDetails.manageseries": "Manage Series",
+   "components.TvDetails.network": "{networkCount, plural, one {Network} other {Networks}}",

@@ -545,15 +545,18 @@ index cbba176..4648656 100644
            id: 'advancedrequest',
            name: intl.formatMessage(messages.advancedrequest),
 diff --git a/src/components/RequestCard/index.tsx b/src/components/RequestCard/index.tsx
-index 0f2341f..536cf0b 100644
+index 0f2341f..f74f335 100644
 --- a/src/components/RequestCard/index.tsx
 +++ b/src/components/RequestCard/index.tsx
-@@ -614,6 +614,31 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
+@@ -614,6 +614,34 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                    </Tooltip>
                  </div>
                )}
 +            {requestData.status !== MediaRequestStatus.PENDING &&
-+              hasPermission(Permission.MANAGE_OWN_REQUESTS) &&
++              hasPermission(
++                [Permission.MANAGE_REQUESTS, Permission.MANAGE_OWN_REQUESTS],
++                { type: 'or' }
++              ) &&
 +              requestData.requestedBy.id === user?.id && (
 +                <div>
 +                  <Button
